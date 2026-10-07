@@ -385,6 +385,7 @@ export type AttackSharkRgb = readonly [number, number, number];
 
 export interface AttackSharkDpiConfig {
   stages: readonly number[];
+  stagePairs?: ReadonlyArray<readonly [number, number]>;
   activeStage: number;
   encoding?: AttackSharkDpiEncoding;
   profileId?: number;
@@ -421,7 +422,7 @@ export function buildAttackSharkDpiReport(config: AttackSharkDpiConfig): Uint8Ar
   buffer[6] = byte(config.xDoubleFlags ?? 0, "xDoubleFlags");
   buffer[7] = byte(config.yDoubleFlags ?? 1, "yDoubleFlags");
   for (let i = 0; i < ATTACKSHARK_DPI_STAGE_COUNT; i++) {
-    const [low, high] = encodeAttackSharkDpiPair(config.stages[i] ?? 0, encoding);
+    const [low, high] = config.stagePairs?.[i] ?? encodeAttackSharkDpiPair(config.stages[i] ?? 0, encoding);
     buffer[8 + i] = low;
     buffer[16 + i] = high;
   }

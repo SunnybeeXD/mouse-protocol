@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   buildX11DpiReport,
+  decodeX11DpiIndicatorColors,
   decodeX11DpiReport,
   encodeX11DpiByte,
   nearestX11Dpi,
@@ -100,4 +101,32 @@ test("decodeX11DpiReport rejects a bad signature or checksum", () => {
   assert.equal(decodeX11DpiReport(badChecksum), null);
 
   assert.equal(decodeX11DpiReport(new Uint8Array([0x38, 0x01])), null);
+});
+
+test("buildX11DpiReport leaves the two spare stage slots zero and keeps the factory indicator colors", () => {
+  const report = buildX11DpiReport({
+    stages: [...X11_DPI_DEFAULT_STAGES],
+    activeStage: X11_DPI_DEFAULT_ACTIVE,
+    angleSnap: false,
+    rippleControl: true,
+  });
+  assert.deepEqual([...report.subarray(14, 16)], [0, 0]);
+  assert.deepEqual([...report.subarray(22, 24)], [0, 0]);
+  assert.deepEqual([...report.subarray(25, 34)], [0xff, 0, 0, 0, 0xff, 0, 0, 0, 0xff]);
+  assert.equal(report[49], 0x02);
+});
+
+test("indicator colors round-trip through the X11 DPI report", () => {
+  const colors = [
+    [1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12], [13, 14, 15], [16, 17, 18], [19, 20, 21], [22, 23, 24],
+  ] as const;
+  const report = buildX11DpiReport({
+    stages: [...X11_DPI_DEFAULT_STAGES],
+    activeStage: 1,
+    angleSnap: false,
+    rippleControl: false,
+    indicatorColors: colors,
+  });
+  assert.deepEqual(decodeX11DpiIndicatorColors(report), colors.map((c) => [...c]));
+  assert.equal(decodeX11DpiIndicatorColors(report.subarray(0, 40)), null);
 });

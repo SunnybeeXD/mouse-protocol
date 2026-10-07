@@ -60,4 +60,8 @@ The vendor writes the first indicator color with an index bug (`n++ + d`). It on
 - Per-model DPI encodings beyond the three above.
 - Reply decoding for lighting, report rate, wake-up and button reads.
 - Whether `0xFA60` and `0xFA65` map to specific models.
-- Driver wiring. The existing `src/drivers/attackshark` driver still uses its own X11 and R1 path.
+- Driver wiring beyond what is listed below.
+
+## Driver wiring
+
+`src/drivers/attackshark/hid.ts` now builds its polling frame with `buildAttackSharkPollingReport`, and `src/compx/x11-dpi.ts` builds the X11 DPI report with `buildAttackSharkDpiReport`. Both outputs are byte-identical to the previous hand-built frames. The X11 family also gained per-stage DPI indicator colors: `dpiStageColors` on the status and `setDpiStageColor(stage, "#rrggbb")`, written through the same 0x04 report. Lighting, wake-up, button and macro frames are in the codec but not yet exposed by the driver, because the shared UI contract needs per-model button names and slot order that the bundle only provides model by model.
