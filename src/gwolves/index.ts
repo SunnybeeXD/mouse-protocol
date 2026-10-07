@@ -306,3 +306,47 @@ export function gwolvesAdvanceCalibration(stage: GWolvesCalibrationStage, depth:
   if (stage === "releaseBoth" && depth.left === 0 && depth.right === 0) return "done";
   return stage;
 }
+
+/**
+ * The PixArt 3955 models (a "_3955" UIFolder in G-Wolves' env-models.json) keep
+ * their DPI stages in 6 byte rows at 0x1B00 instead of 4 byte rows at 0x0C:
+ * `[xLo, xHi, yLo, yHi, hi, crc]`, DPI stored as value minus one with step 1,
+ * the two high bits of x in bits 2-3 of `hi` and of y in bits 6-7, and a crc
+ * that makes the first five bytes plus it sum to 0x55.
+ */
+export const GWOLVES_DPI_3955_ADDRESS = 0x1b00;
+export const GWOLVES_DPI_3955_ROW = 6;
+export const GWOLVES_DPI_3955_MAX = 40_000;
+
+export function gwolvesEncodeDpi3955(x: number, y: number = x): Uint8Array {
+  for (const value of [x, y]) {
+    if (!Number.isInteger(value) || value < 1 || value > GWOLVES_DPI_3955_MAX) {
+      throw new RangeError(`G-Wolves 3955 DPI must be 1 to ${GWOLVES_DPI_3955_MAX.toLocaleString()}.`);
+    }
+  }
+  const cx = x - 1;
+  const cy = y - 1;
+  const row = new Uint8Array(GWOLVES_DPI_3955_ROW);
+  row[0] = cx & 0xff;
+  row[1] = (cx >> 8) & 0xff;
+  row[2] = cy & 0xff;
+  row[3] = (cy >> 8) & 0xff;
+  row[4] = ((cx >> 16) << 2) | ((cy >> 16) << 6);
+  row[5] = (0x55 - row.subarray(0, 5).reduce((sum, byte) => sum + byte, 0)) & 0xff;
+  return row;
+}
+
+/** Null when the row fails its checksum, which is how an unset slot reads. */
+export function gwolvesDecodeDpi3955(row: Uint8Array | readonly number[]): { x: number; y: number } | null {
+  if (row.length < GWOLVES_DPI_3955_ROW) return null;
+  let sum = 0;
+  for (let index = 0; index < GWOLVES_DPI_3955_ROW; index += 1) sum += row[index]! & 0xff;
+  if ((sum & 0xff) !== 0x55) return null;
+  const flags = row[4]! & 0xff;
+  let x = (row[0]! | (row[1]! << 8) | (((flags & 0x0c) >> 2) << 16)) + 1;
+  const y = (row[2]! | (row[3]! << 8) | (((flags & 0xc0) >> 6) << 16)) + 1;
+  // The web driver doubles x for each of these two flag bits; it never writes them.
+  if (flags & 1) x *= 2;
+  if (flags & 2) x *= 2;
+  return { x, y };
+}

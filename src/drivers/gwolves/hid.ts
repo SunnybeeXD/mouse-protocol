@@ -2,7 +2,9 @@ import type { MagneticButtonsStatus, MagneticCalibrationProgress, MouseStatus } 
 import {
   GWOLVES_ADDRESS,
   GWOLVES_COMMAND,
-  GWOLVES_HTS_PLUS_PRO_MODEL_ID,
+  GWOLVES_DPI_3955_ADDRESS,
+  GWOLVES_DPI_3955_MAX,
+  GWOLVES_DPI_3955_ROW,
   GWOLVES_NOTIFICATION,
   GWOLVES_RAPID_TRIGGER_MAX,
   GWOLVES_REPORT_ID,
@@ -14,9 +16,11 @@ import {
   gwolvesBuildSimplePayload,
   gwolvesBuildWritePayload,
   gwolvesBuildWriteScalarPayload,
+  gwolvesDecodeDpi3955,
   gwolvesDecodeProfile,
   gwolvesDecodeRapidTrigger,
   gwolvesDecodeTriggerPoint,
+  gwolvesEncodeDpi3955,
   gwolvesEncodeRapidTrigger,
   gwolvesEncodeTriggerPoint,
   gwolvesParseButtonDepth,
@@ -80,6 +84,7 @@ export class GWolvesHidClient {
   /** Exposed so tests do not have to wait out the real delays. */
   calibrationTiming = { ...CALIBRATION_TIMING };
   private receiverModelId: number | null | undefined;
+  private resolved: GWolvesProduct | undefined;
   private readonly depthListeners = new Set<(left: number, right: number) => void>();
 
   private readonly onInputReport = (event: HIDInputReportEvent): void => {
@@ -124,6 +129,24 @@ export class GWolvesHidClient {
     return product;
   }
 
+  /**
+   * The model's own catalog entry. Over cable that is the product id's entry;
+   * behind the shared 0x3854 receiver it is the entry whose model id the mouse
+   * answered with, once {@link identify} has asked, and the receiver's own
+   * entry until then.
+   */
+  private get model(): GWolvesProduct {
+    return this.resolved ?? this.product;
+  }
+
+  private async identify(): Promise<void> {
+    if (!this.product.wireless || this.receiverModelId !== undefined) return;
+    this.receiverModelId = await this.transact(gwolvesBuildModelPayload(Array.from({ length: 4 }, () => Math.floor(Math.random() * 256))))
+      .then((response) => gwolvesParseModelId(response)?.modelId ?? null)
+      .catch(() => null);
+    this.resolved = [...GWOLVES_PRODUCTS.values()].find((entry) => entry.protocol === "vgn" && entry.mid === this.receiverModelId);
+  }
+
   isWirelessPath(): boolean {
     return this.product.wireless;
   }
@@ -134,7 +157,8 @@ export class GWolvesHidClient {
 
   getDpiOptions(): number[] {
     const values: number[] = [];
-    for (let dpi = 50; dpi <= 26_000; dpi += 50) values.push(dpi);
+    const ceiling = this.model.sensor === "3955" ? GWOLVES_DPI_3955_MAX : 26_000;
+    for (let dpi = 50; dpi <= ceiling; dpi += 50) values.push(dpi);
     return values;
   }
 
@@ -147,8 +171,9 @@ export class GWolvesHidClient {
   async readStatus(): Promise<MouseStatus> {
     await this.open();
     const { wireless } = this.product;
-    const magnetic = await this.isMagnetic();
-    const model = magnetic && wireless ? "HTS Plus Pro" : this.product.model;
+    await this.identify();
+    const magnetic = this.model.magnetic === true;
+    const model = this.model.model;
     const batteryResponse = await this.transact(gwolvesBuildSimplePayload(GWOLVES_COMMAND.battery));
     const firmwareResponse = await this.transact(gwolvesBuildSimplePayload(GWOLVES_COMMAND.firmware));
     const profile = await this.readProfile();
@@ -156,6 +181,10 @@ export class GWolvesHidClient {
     const keys = await teevolutionReadKeyTable((address, length) => this.read(address, length)).catch(() => null);
     const battery = gwolvesParseBattery(batteryResponse);
     const settings = gwolvesDecodeProfile(profile);
+    const is3955 = this.model.sensor === "3955";
+    // The 3955 keeps its stages in 6 byte rows elsewhere, so the 4 byte row
+    // decoded above is not its DPI. An unreadable row reports the default.
+    const dpi = is3955 ? (await this.readDpi3955(settings.activeDpiStage))?.x ?? 800 : settings.dpi;
     const firmware = this.version(firmwareResponse);
 
     return {
@@ -166,7 +195,7 @@ export class GWolvesHidClient {
       batteryState: battery
         ? battery.charging ? (battery.percent >= 99 ? "Full" : "Charging") : "Discharging"
         : "Unknown",
-      dpi: settings.dpi,
+      dpi,
       pollingRateHz: settings.pollingRateHz,
       supportedPollingRates: SUPPORTED_POLLING_RATES,
       activeProfile: null,
@@ -178,7 +207,8 @@ export class GWolvesHidClient {
       angleSnapping: settings.angleSnapping,
       rippleControl: settings.rippleControl,
       performanceMode: settings.performanceMode,
-      liftOffDistance: settings.liftOffDistance,
+      // The 3955 has five lift-off steps, which Low, Medium and High cannot name.
+      liftOffDistance: is3955 ? null : settings.liftOffDistance,
       ...(magnetic ? { magneticButtons: await this.readMagnetic().catch(() => undefined) } : {}),
       ...(keys ? { buttonMappings: teevolutionDecodeButtonMappings(keys, 0, BUTTON_LIMITS.buttons), buttonOptions: BUTTON_LIMITS.actions } : {}),
       firmware: firmware ? [`Mouse ${firmware}`] : [],
@@ -193,11 +223,19 @@ export class GWolvesHidClient {
   }
 
   async setDpi(dpi: number): Promise<number> {
+    await this.identify();
+    if (this.model.sensor === "3955") {
+      const stage = gwolvesDecodeProfile(await this.readProfile()).activeDpiStage;
+      await this.write(GWOLVES_DPI_3955_ADDRESS + stage * GWOLVES_DPI_3955_ROW, [...gwolvesEncodeDpi3955(dpi)]);
+      const kept = await this.readDpi3955(stage);
+      if (kept?.x !== dpi || kept.y !== dpi) throw new Error(`The ${this.model.model} kept ${kept ? kept.x : "an unreadable"} DPI instead of ${dpi} DPI.`);
+      return kept.x;
+    }
     const profile = gwolvesDecodeProfile(await this.readProfile());
     const address = GWOLVES_ADDRESS.dpiStages + profile.activeDpiStage * 4;
     await this.write(address, [...gwolvesEncodeDpi(dpi)]);
     const confirmed = gwolvesDecodeProfile(await this.readProfile()).dpi;
-    if (confirmed !== dpi) throw new Error(`The ${this.product.model} kept ${confirmed} DPI instead of ${dpi} DPI.`);
+    if (confirmed !== dpi) throw new Error(`The ${this.model.model} kept ${confirmed} DPI instead of ${dpi} DPI.`);
     return confirmed;
   }
 
@@ -208,16 +246,20 @@ export class GWolvesHidClient {
       const hint = this.isWirelessPath()
         ? " (on the wireless path, the mouse must be actively awake — try moving it first)"
         : "";
-      throw new Error(`The ${this.product.model} kept ${confirmed} Hz instead of ${rate} Hz.${hint}`);
+      throw new Error(`The ${this.model.model} kept ${confirmed} Hz instead of ${rate} Hz.${hint}`);
     }
     return confirmed;
   }
 
   async setLiftOffDistance(value: NonNullable<MouseStatus["liftOffDistance"]>): Promise<NonNullable<MouseStatus["liftOffDistance"]>> {
+    await this.identify();
+    if (this.model.sensor === "3955") {
+      throw new Error(`The ${this.model.model} has five lift-off steps, which are not supported yet.`);
+    }
     const raw = value === "Low" ? 3 : value === "Medium" ? 1 : 2;
     await this.writeScalar(GWOLVES_ADDRESS.lod, raw);
     const confirmed = gwolvesDecodeProfile(await this.readProfile()).liftOffDistance;
-    if (confirmed !== value) throw new Error(`The ${this.product.model} kept ${confirmed ?? "unknown"} LOD instead of ${value}.`);
+    if (confirmed !== value) throw new Error(`The ${this.model.model} kept ${confirmed ?? "unknown"} LOD instead of ${value}.`);
     return confirmed;
   }
 
@@ -238,13 +280,8 @@ export class GWolvesHidClient {
 
   /** True for the magnetic model. On the shared receiver the mouse behind it is asked once. */
   async isMagnetic(): Promise<boolean> {
-    if (!this.product.wireless) return this.product.magnetic === true;
-    if (this.receiverModelId === undefined) {
-      this.receiverModelId = await this.transact(gwolvesBuildModelPayload(Array.from({ length: 4 }, () => Math.floor(Math.random() * 256))))
-        .then((response) => gwolvesParseModelId(response)?.modelId ?? null)
-        .catch(() => null);
-    }
-    return this.receiverModelId === GWOLVES_HTS_PLUS_PRO_MODEL_ID;
+    await this.identify();
+    return this.model.magnetic === true;
   }
 
   async readMagnetic(): Promise<MagneticButtonsStatus> {
@@ -276,7 +313,7 @@ export class GWolvesHidClient {
   async setMagneticTriggerPoint(button: 0 | 1, point: number): Promise<number> {
     await this.writeScalar(MAGNETIC_ADDRESS.trigger[button], gwolvesEncodeTriggerPoint(point));
     const confirmed = gwolvesDecodeTriggerPoint(await this.read(MAGNETIC_ADDRESS.trigger[button], 2));
-    if (confirmed !== point) throw new Error(`The ${this.product.model} kept trigger point ${confirmed ?? "unknown"} instead of ${point}.`);
+    if (confirmed !== point) throw new Error(`The ${this.model.model} kept trigger point ${confirmed ?? "unknown"} instead of ${point}.`);
     return confirmed;
   }
 
@@ -285,7 +322,7 @@ export class GWolvesHidClient {
     await this.writeScalar(MAGNETIC_ADDRESS.rapidTrigger[button], gwolvesEncodeRapidTrigger(enabled, level));
     const confirmed = gwolvesDecodeRapidTrigger(await this.read(MAGNETIC_ADDRESS.rapidTrigger[button], 2));
     if (!confirmed || confirmed.enabled !== enabled || confirmed.level !== level) {
-      throw new Error(`The ${this.product.model} did not keep the rapid trigger setting.`);
+      throw new Error(`The ${this.model.model} did not keep the rapid trigger setting.`);
     }
     return confirmed;
   }
@@ -358,6 +395,10 @@ export class GWolvesHidClient {
     if (this.device.opened) await this.device.close();
   }
 
+  private async readDpi3955(stage: number): Promise<{ x: number; y: number } | null> {
+    return gwolvesDecodeDpi3955(await this.read(GWOLVES_DPI_3955_ADDRESS + stage * GWOLVES_DPI_3955_ROW, GWOLVES_DPI_3955_ROW));
+  }
+
   private async readProfile(): Promise<Uint8Array> {
     const profile = new Uint8Array(0xb7);
     for (const [start, end] of [[0, 0x2c], [0xa8, 0xb7]] as const) {
@@ -372,25 +413,25 @@ export class GWolvesHidClient {
   private async read(address: number, length: number): Promise<Uint8Array> {
     const response = await this.transact(gwolvesBuildReadPayload(address, length));
     const data = gwolvesParseReadResponse(response, address, length);
-    if (!data) throw new Error(`${this.product.model} flash read failed at 0x${address.toString(16)}.`);
+    if (!data) throw new Error(`${this.model.model} flash read failed at 0x${address.toString(16)}.`);
     return data;
   }
 
   private async writeScalar(address: number, value: number): Promise<void> {
     const response = await this.transact(gwolvesBuildWriteScalarPayload(address, value));
     if (!gwolvesReportChecksumIsValid(response) || response[0] !== GWOLVES_COMMAND.write || response[1] !== 0) {
-      throw new Error(`${this.product.model} flash write failed at 0x${address.toString(16)}.`);
+      throw new Error(`${this.model.model} flash write failed at 0x${address.toString(16)}.`);
     }
     const confirmed = await this.read(address, 2);
     if (confirmed[0] !== value || ((confirmed[0]! + confirmed[1]!) & 0xff) !== 0x55) {
-      throw new Error(`The ${this.product.model} did not retain the value written at 0x${address.toString(16)}.`);
+      throw new Error(`The ${this.model.model} did not retain the value written at 0x${address.toString(16)}.`);
     }
   }
 
   private async write(address: number, data: readonly number[]): Promise<void> {
     const response = await this.transact(gwolvesBuildWritePayload(address, data));
     if (!gwolvesReportChecksumIsValid(response) || response[0] !== GWOLVES_COMMAND.write || response[1] !== 0) {
-      throw new Error(`${this.product.model} flash write failed at 0x${address.toString(16)}.`);
+      throw new Error(`${this.model.model} flash write failed at 0x${address.toString(16)}.`);
     }
   }
 
