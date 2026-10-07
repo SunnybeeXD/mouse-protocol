@@ -29,6 +29,10 @@
       "types": "./dist/atk/index.d.ts",
       "import": "./dist/atk/index.js"
     },
+    "./attackshark": {
+      "types": "./dist/attackshark/index.d.ts",
+      "import": "./dist/attackshark/index.js"
+    },
     "./bitmouse": {
       "types": "./dist/bitmouse/index.d.ts",
       "import": "./dist/bitmouse/index.js"
