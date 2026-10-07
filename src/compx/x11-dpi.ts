@@ -13,8 +13,16 @@
 // Above 10,000 the byte repeats across register pages, so the stage mask and
 // high flag bytes are what disambiguate a value on read.
 
+import {
+  ATTACKSHARK_DPI_INDICATOR_COLORS,
+  attackSharkSum16,
+  buildAttackSharkDpiReport,
+  type AttackSharkRgb,
+} from "../attackshark/index.ts";
+
 export const X11_DPI_REPORT_ID = 0x04;
 export const X11_DPI_STAGE_COUNT = 6;
+const X11_DPI_SLOT_COUNT = 8;
 export const X11_DPI_MIN = 50;
 export const X11_DPI_MAX = 22000;
 export const X11_DPI_STEP = 50;
@@ -133,12 +141,11 @@ export interface X11DpiConfig {
   rippleControl: boolean;
   /** Wired units take only the first 52 bytes. */
   wired?: boolean;
+  indicatorColors?: readonly AttackSharkRgb[];
 }
 
 function checksum(buffer: Uint8Array): number {
-  let sum = 0;
-  for (let i = 3; i <= 49; i++) sum = (sum + buffer[i]) & 0xffff;
-  return sum;
+  return attackSharkSum16(buffer, 3, 50);
 }
 
 /**
@@ -146,48 +153,45 @@ function checksum(buffer: Uint8Array): number {
  * hand this to `sendFeatureReport(X11_DPI_REPORT_ID, buffer.subarray(1))`.
  */
 export function buildX11DpiReport(config: X11DpiConfig): Uint8Array {
-  const buffer = new Uint8Array(56);
-  buffer[0] = X11_DPI_REPORT_ID;
-  buffer[1] = 0x38;
-  buffer[2] = 0x01;
-  buffer[3] = config.angleSnap ? 0x01 : 0x00;
-  buffer[4] = config.rippleControl ? 0x01 : 0x00;
-  buffer[5] = 0x3f;
-
   let mask = 0;
+  const stagePairs: Array<[number, number]> = [];
   for (let i = 0; i < X11_DPI_STAGE_COUNT; i++) {
     const dpi = config.stages[i] ?? X11_DPI_DEFAULT_STAGES[i] ?? 800;
-    buffer[8 + i] = encodeX11DpiByte(dpi);
     if (dpi > 12000) mask |= 0x01 << i;
     const high = (dpi >= 10100 && dpi <= 12000) || (dpi >= 20100 && dpi <= 22000);
-    buffer[16 + i] = high ? 0x01 : 0x00;
+    stagePairs.push([encodeX11DpiByte(dpi), high ? 0x01 : 0x00]);
   }
-  buffer[6] = mask;
-  buffer[7] = mask;
-  // 14, 15, 22, 23 stay zero.
-  buffer[24] = config.activeStage;
-
-  buffer[25] = 0xff;
-  buffer[29] = 0xff;
-  buffer[33] = 0xff;
-  buffer[34] = 0xff;
-  buffer[35] = 0xff;
-  buffer[38] = 0xff;
-  buffer[39] = 0xff;
-  buffer[40] = 0xff;
-  buffer[42] = 0xff;
-  buffer[43] = 0xff;
-  buffer[44] = 0x40;
-  buffer[46] = 0xff;
-  buffer[47] = 0xff;
-  buffer[48] = 0xff;
-  buffer[49] = 0x02;
-
-  const sum = checksum(buffer);
-  buffer[50] = (sum >> 8) & 0xff;
-  buffer[51] = sum & 0xff;
-
+  while (stagePairs.length < X11_DPI_SLOT_COUNT) stagePairs.push([0, 0]);
+  const buffer = buildAttackSharkDpiReport({
+    stages: [],
+    stagePairs,
+    activeStage: config.activeStage,
+    sensitivityX: config.angleSnap ? 0x01 : 0x00,
+    sensitivityY: config.rippleControl ? 0x01 : 0x00,
+    enabledMask: 0x3f,
+    xDoubleFlags: mask,
+    yDoubleFlags: mask,
+    indicatorColors: config.indicatorColors ?? ATTACKSHARK_DPI_INDICATOR_COLORS,
+    indicatorType: 0x02,
+  }).subarray(0, 56);
   return config.wired ? buffer.subarray(0, 52) : buffer;
+}
+
+export function decodeX11DpiIndicatorColors(data: Uint8Array): AttackSharkRgb[] | null {
+  let buffer = data;
+  if (buffer.length >= 2 && buffer[0] === 0x38 && buffer[1] === 0x01) {
+    const full = new Uint8Array(buffer.length + 1);
+    full.set(buffer, 1);
+    full[0] = X11_DPI_REPORT_ID;
+    buffer = full;
+  }
+  if (buffer.length < 52 || buffer[0] !== X11_DPI_REPORT_ID || buffer[1] !== 0x38 || buffer[2] !== 0x01) return null;
+  if (checksum(buffer) !== (((buffer[50] << 8) | buffer[51]) & 0xffff)) return null;
+  const colors: AttackSharkRgb[] = [];
+  for (let i = 0; i < X11_DPI_SLOT_COUNT; i++) {
+    colors.push([buffer[25 + i * 3], buffer[26 + i * 3], buffer[27 + i * 3]]);
+  }
+  return colors;
 }
 
 /**

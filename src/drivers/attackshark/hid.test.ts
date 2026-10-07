@@ -441,3 +441,40 @@ test("receiver writes are spaced by the minimum gap, even from overlapping calls
     assert.ok(sentAt[i] - sentAt[i - 1] >= 195, `write ${i} came ${sentAt[i] - sentAt[i - 1]} ms after the previous one`);
   }
 });
+
+test("native X11 adapter reports DPI indicator colors and writes a changed stage color", async () => {
+  resetAttackSharkX11DpiState();
+  resetAttackSharkX11RuntimeState();
+  const sent: Array<{ reportId: number; data: number[] }> = [];
+  const native = {
+    vendorId: 0x1d57,
+    productId: 0xfa60,
+    productName: "2.4G Wireless Device",
+    collections: [],
+    opened: false,
+    open() { (this as { opened: boolean }).opened = true; return Promise.resolve(); },
+    close() { (this as { opened: boolean }).opened = false; return Promise.resolve(); },
+    sendFeatureReport(reportId: number, data: BufferSource) {
+      sent.push({ reportId, data: [...new Uint8Array(data as ArrayBuffer)] });
+      return Promise.resolve();
+    },
+    receiveFeatureReport() { return Promise.resolve(new DataView(new ArrayBuffer(0))); },
+    addEventListener() {},
+    removeEventListener() {},
+  } as unknown as HIDDevice;
+
+  const client = new AttackSharkHidClient(native, { batteryWaitMs: 0 });
+  const status = await client.readStatus();
+  assert.deepEqual(status.dpiStageColors, ["#ff0000", "#00ff00", "#0000ff", "#ffff00", "#00ffff", "#ff00ff"]);
+
+  assert.equal(await client.setDpiStageColor(2, "#112233"), "#112233");
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].reportId, 0x04);
+  assert.deepEqual(sent[0].data.slice(30, 33), [0x11, 0x22, 0x33]);
+  assert.deepEqual(sent[0].data.slice(24, 30), [0xff, 0, 0, 0, 0xff, 0]);
+  const next = await client.readStatus();
+  assert.equal(next.dpiStageColors?.[2], "#112233");
+
+  await assert.rejects(client.setDpiStageColor(6, "#112233"), RangeError);
+  await assert.rejects(client.setDpiStageColor(0, "red"), RangeError);
+});

@@ -3,7 +3,13 @@ import { VENDOR_ID } from "../vendors.ts";
 import { LAMZU_PRODUCTS } from "@openmouse/protocol/lamzu";
 import { DELUX_M600_PRO_MODEL_ID, DELUX_UNBRANDED_PRODUCT_IDS } from "@openmouse/protocol/delux";
 import {
+  ATTACKSHARK_DPI_INDICATOR_COLORS,
+  buildAttackSharkPollingReport,
+  type AttackSharkRgb,
+} from "../../attackshark/index.ts";
+import {
   buildX11DpiReport,
+  decodeX11DpiIndicatorColors,
   decodeX11DpiReport,
   nearestX11Dpi,
   X11_DPI_DEFAULT_ACTIVE,
@@ -146,6 +152,16 @@ export const POLLING_CODES_25A7: ReadonlyMap<number, number> = new Map([
 
 // ── Collection helpers ─────────────────────────────────────────────────────
 
+function rgbToHex(color: AttackSharkRgb): string {
+  return `#${color.map((value) => value.toString(16).padStart(2, "0")).join("")}`;
+}
+
+function parseHexColor(color: string): AttackSharkRgb | null {
+  const match = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(color);
+  if (!match) return null;
+  return [parseInt(match[1], 16), parseInt(match[2], 16), parseInt(match[3], 16)];
+}
+
 function hasFeatureReports(collection: HIDCollectionInfo): boolean {
   if (collection.featureReports.length > 0) return true;
   return collection.children.some(hasFeatureReports);
@@ -226,6 +242,7 @@ interface X11DpiState {
   activeStage: number;
   angleSnap: boolean;
   rippleControl: boolean;
+  colors: AttackSharkRgb[];
 }
 
 const x11DpiStates = new Map<number, X11DpiState>();
@@ -238,6 +255,7 @@ function x11DpiStateFor(productId: number): X11DpiState {
       activeStage: X11_DPI_DEFAULT_ACTIVE,
       angleSnap: false,
       rippleControl: true,
+      colors: ATTACKSHARK_DPI_INDICATOR_COLORS.map((color) => [...color] as unknown as AttackSharkRgb),
     };
     x11DpiStates.set(productId, state);
   }
@@ -637,6 +655,7 @@ export class AttackSharkHidClient {
         ? {
           dpiStages: [...dpiState.stages],
           activeDpiStage: dpiState.activeStage - 1,
+          dpiStageColors: dpiState.colors.slice(0, X11_DPI_STAGE_COUNT).map(rgbToHex),
           angleSnapping: dpiState.angleSnap,
           rippleControl: dpiState.rippleControl,
         }
@@ -715,6 +734,7 @@ export class AttackSharkHidClient {
       activeStage: state.activeStage,
       angleSnap: state.angleSnap,
       rippleControl: state.rippleControl,
+      indicatorColors: state.colors,
       wired: this.x11UsesShortDpiReport(),
     });
     // The buffer's leading byte is the report id; WebHID/Tauri take it
@@ -755,6 +775,8 @@ export class AttackSharkHidClient {
       state.activeStage = decoded.activeStage;
       state.angleSnap = decoded.angleSnap;
       state.rippleControl = decoded.rippleControl;
+      const colors = decodeX11DpiIndicatorColors(bytes);
+      if (colors) state.colors = colors;
     } catch {
       // No read-back on this firmware/transport; keep the cached table.
     }
@@ -820,6 +842,25 @@ export class AttackSharkHidClient {
       };
     }
     return stage;
+  }
+
+  /** Sets one stage's indicator LED color. `stage` is 0-based, `color` is #rrggbb. */
+  async setDpiStageColor(stage: number, color: string): Promise<string> {
+    this.requireX11Dpi();
+    if (!Number.isInteger(stage) || stage < 0 || stage >= X11_DPI_STAGE_COUNT) {
+      throw new RangeError(`This mouse has no DPI stage ${stage + 1}.`);
+    }
+    const rgb = parseHexColor(color);
+    if (!rgb) throw new RangeError(`${color} is not a #rrggbb color.`);
+    const state = x11DpiStateFor(this.device.productId);
+    state.colors = state.colors.map((entry, index) => (index === stage ? rgb : entry));
+    await this.writeX11Dpi();
+    const hex = rgbToHex(rgb);
+    if (this.lastStatus) {
+      const dpiStageColors = state.colors.slice(0, X11_DPI_STAGE_COUNT).map(rgbToHex);
+      this.lastStatus = { ...this.lastStatus, dpiStageColors };
+    }
+    return hex;
   }
 
   async setAngleSnapping(enabled: boolean): Promise<boolean> {
@@ -916,9 +957,7 @@ export class AttackSharkHidClient {
 
   private async write1d57PollingRate(rateByte: number): Promise<void> {
     await this.open();
-    // 8 data bytes — browser prepends report ID 0x06.
-    // Structure: [0x09, 0x01, rate, checksum, 0, 0, 0, 0]
-    const data = new Uint8Array([0x09, 0x01, rateByte, (0xff - rateByte) & 0xff, 0, 0, 0, 0]);
+    const data = new Uint8Array(buildAttackSharkPollingReport(rateByte).subarray(1, 9));
     await this.sendConfigReport(POLLING_REPORT_ID, data);
     await this.delay(CMD_DELAY_MS);
   }
