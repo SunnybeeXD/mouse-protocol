@@ -379,3 +379,23 @@ validate it, so OpenMouse does not claim that field as an integrity check.
 
 Firmware parsing is read-only. Entering boot mode, erase preparation, chunk
 transfers, factory reset, and macro clearing remain intentionally unavailable.
+
+## Refreshing the device catalog
+
+`src/drivers/atk/device-catalog.generated.ts` is generated from the ATK HUB web
+bundle. HUB 3.2.28 and later split the app into many chunks, so fetch the
+entry file named in `https://hub.atk.pro/` and every chunk it references into
+one empty directory, then run:
+
+```sh
+node scripts/extract-atk-catalog.mjs <bundle-dir> \
+  --out src/drivers/atk/device-catalog.generated.ts \
+  --version <x.y.z> --entry <index-file.js>
+```
+
+The script only reads the bundle as text. It lists mice that report a sensor and
+a CID/MID, skips receivers and keyboards, and fails on a sensor the codec does
+not know yet. Entries whose USB id the hub no longer lists are kept, and a
+warning names them, so a refresh never strips a mouse that is still in use.
+Colour variants that share a USB id and model name are listed once, as before.
+Review the diff for removed or renamed models before committing.
